@@ -313,8 +313,36 @@ abstract class SolrIndex extends SearchIndex {
 	 *  - 'Matches': ArrayList of the matched object instances
 	 */
 	public function search(SearchQuery $query, $offset = -1, $limit = -1, $params = array()) {
-		$service = $this->getService();
-		
+
+		$builtQuery = $this->buildSearchQuery($query);
+
+		$q = $builtQuery["q"];
+		$fq = $builtQuery["fq"];
+
+		if(!headers_sent()) {
+			if ($q) header('X-Query: '.implode(' ', $q));
+			if ($fq) header('X-Filters: "'.implode('", "', $fq).'"');
+		}
+
+		if ($offset == -1) $offset = $query->start;
+		if ($limit == -1) $limit = $query->limit;
+		if ($limit == -1) $limit = SearchQuery::$default_page_size;
+
+		$response = $this->rawSearch($q, $fq, $offset, $limit, $params);
+
+		$results = $this->fetchResults($response);
+
+		return $results;
+	}
+
+
+	/**
+	 * Takes a search query and builds a valid Solr query(q) and filterquery(fq) from it
+	 *
+	 * @param SearchQuery $query
+	 * @return array An array of format ("q" => $query, "fq" => $filterQuery)
+	 */
+	public function buildSearchQuery(SearchQuery $query) {
 		SearchVariant::with(count($query->classes) == 1 ? $query->classes[0]['class'] : null)->call('alterQuery', $query, $this);
 
 		$q = array();
@@ -405,27 +433,56 @@ abstract class SolrIndex extends SearchIndex {
 			$fq[] = ($missing ? "+{$field}:[* TO *] " : '') . '-('.implode(' ', $excludeq).')';
 		}
 
-		if(!headers_sent()) {
-			if ($q) header('X-Query: '.implode(' ', $q));
-			if ($fq) header('X-Filters: "'.implode('", "', $fq).'"');
-		}
+		return array(
+			"q" => $q,
+			"fq" => $fq
+		);
+	}
 
-		if ($offset == -1) $offset = $query->start;
-		if ($limit == -1) $limit = $query->limit;
-		if ($limit == -1) $limit = SearchQuery::$default_page_size;
+	/**
+	 *
+	 * Perform a raw Solr search with query ($q), filter query ($fq) arrays and any other params.
+	 *
+	 * @param array $q		An array of query strings
+	 * @param array $fq		An array of filter query strings
+	 * @param int $offset 	The starting offset for result documents
+	 * @param int $limit 	The maximum number of result documents to return
+	 * @param array $params	key / value pairs for other query parameters (see Solr documentation)
+	 * @return Apache_Solr_Response
+	 */
+	public function rawSearch($q, $fq, $offset = -1, $limit = -1, $params = array()) {
+		$service = $this->getService();
 
 		$params = array_merge($params, array('fq' => implode(' ', $fq)));
 
 		$res = $service->search(
-			$q ? implode(' ', $q) : '*:*', 
-			$offset, 
-			$limit, 
-			$params, 
+			$q ? implode(' ', $q) : '*:*',
+			$offset,
+			$limit,
+			$params,
 			Apache_Solr_Service::METHOD_POST
 		);
 
+		return $res;
+	}
+
+	/**
+	 * Takes a raw Solr search() response, and fetches any SilverStripe DataObjects that match
+	 *
+	 * @param Apache_Solr_Response $res
+	 * @return ArrayData with the following keys:
+	 *  - 'Matches': ArrayList of the matched object instances
+	 */
+	public function fetchResults($res) {
 		$results = new ArrayList();
+
+		$offset = 0;
+		$limit = -1;
+
 		if($res->getHttpStatus() >= 200 && $res->getHttpStatus() < 300) {
+			$offset = $res->responseHeader->params->start;
+			$limit = $res->responseHeader->params->rows;
+
 			foreach ($res->response->docs as $doc) {
 				$result = DataObject::get_by_id($doc->ClassName, $doc->ID);
 				if($result) {
